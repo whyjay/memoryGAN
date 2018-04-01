@@ -17,13 +17,6 @@ web/js/gen_layers.js
 # checkpoint
 dataset
 dataset/*
-checkpoint
-checkpoints
-affmnist_checkpoints
-fashion_checkpoints
-inception_score/checkpoints
-inception_score/affmnist_checkpoints
-inception_map
 
 # trash
 .dropbox
