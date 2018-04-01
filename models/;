@@ -1,0 +1,223 @@
+import tensorflow as tf
+from model import save_images
+import os
+import time
+import numpy as np
+from utils import *
+from IPython import embed
+
+THRES = 100000
+M_INTERVAL = 3000
+M_ITER = 20
+
+def train_gmm(model, config):
+    init_op = tf.global_variables_initializer()
+    model.sess.run(init_op)
+
+    merged_sum = tf.summary.merge_all()
+    model.writer = tf.summary.FileWriter(os.path.join(
+        "logs", config.exp_num, config.model, config.dataset_name, config.z_form, config.timestamp), model.sess.graph)
+
+    coord = tf.train.Coordinator()
+    threads = tf.train.start_queue_runners(coord=coord)
+
+    if model.load(model.checkpoint_dir):
+        print(" [*] Load SUCCESS")
+    else:
+        print(" [!] Load failed...")
+
+    if not os.path.exists(config.data_path):
+        print(" [!] Data does not exist : %s" % config.data_path)
+    with open(config.data_path) as f:
+        all_data = np.load(f)
+
+    all_labels = all_data[:,0]
+    all_images = all_data[:,1:]
+
+
+    start_time = time.time()
+    print_time = time.time()
+    save_time = time.time()
+
+    idx = 0
+    try:
+        while not coord.should_stop():
+            idx += 1
+            batch_start_time = time.time()
+
+            if not config.is_wgan:
+                d_iters = 1
+            elif idx % 500 == 0 or idx < 25:
+                d_iters = 25
+            else:
+                d_iters = 5
+
+            # D image
+            for _ in range(d_iters):
+                _, errD_fake, errD_real, z, summary = model.sess.run(
+                    [model.d_image_optim, model.d_loss_fakes[0], model.d_loss_reals[0], model.z, merged_sum],
+                    feed_dict=get_batch_feed_dict(model, all_images, all_labels))
+                '''
+                if config.is_wgan:
+                    _ = model.sess.run([model.clip_d_op], feed_dict=feed_dict)
+                '''
+            model.writer.add_summary(summary, idx)
+
+
+            # G image
+            feed_dict = get_batch_feed_dict(model, all_images, all_labels)
+            feed_dict[model.z] = z
+            _, errG, summary = model.sess.run(
+                [model.g_optim, model.g_losses[0], merged_sum], feed_dict=feed_dict)
+            model.writer.add_summary(summary, idx)
+
+
+            # log
+            if time.time() - print_time > 30. * 500. / config.batch_size:
+                print_time = time.time()
+                total_time = print_time - start_time
+                d_loss = errD_fake + errD_real
+                sec_per_batch = (print_time - start_time) / (idx + 1.)
+                sec_this_batch = print_time - batch_start_time
+                log = "[Batch %(idx)d] time: %(total_time)4.4f, d_loss: %(d_loss).8f, g_loss: %(errG).8f, d_loss_real: %(errD_real).8f, d_loss_fake: %(errD_fake).8f, sec/this batch: %(sec_this_batch)4.4f" % locals()
+                if config.is_mixture:
+                    log += ", n_mode: %d" % model.modes.shape[0]
+                print log
+
+            # save checkpoint
+            if idx % int(500. * 500./config.batch_size) == 0:
+                if 'gmm_' in config.dataset_name:
+                    _save_samples_gmm(model, idx)
+                else:
+                    _save_samples(model, idx)
+                save_time = time.time()
+                model.save(config.checkpoint_dir, idx)
+
+    except tf.errors.OutOfRangeError:
+        print "Done training; epoch limit reached."
+    finally:
+        coord.request_stop()
+
+    coord.join(threads)
+    # sess.close()
+
+def _save_samples_gmm(model, idx):
+    samples = []
+
+    '''
+    pts = np.array(range(-200, 200))/100.
+    xs = np.meshgrid(pts, pts)[0].reshape((-1, 2))
+    ys = np.meshgrid(pts, pts)[0].transpose.reshape((-1, 2))
+    '''
+
+    # generator hard codes the batch size
+    for i in xrange(model.sample_size // (model.batch_size*model.y_dim)):
+        for y in xrange(model.y_dim):
+
+            y_arr = np.ones((model.batch_size,1), dtype=np.int64)
+            if model.is_cond:
+                y_arr *= y
+            y_onehot = np.zeros((model.batch_size, model.y_dim), dtype=np.int64)
+            y_onehot[:,y] = 1
+
+            feed_dict = {}
+            if model.is_mixture:
+                feed_dict[model.z] = sample_mixture_z_meanshift(model)
+            else:
+                feed_dict[model.labels] = y_onehot
+
+            cur_samples = model.sess.run([model.Gs[0]], feed_dict=feed_dict)[0]
+            cur_samples = np.hstack((y_arr, cur_samples))
+            samples.append(cur_samples)
+
+    samples = np.concatenate(samples, axis=0)
+    samples = samples.reshape((-1,3))
+
+    print  "Save Samples (cond=%s) at %s/%s" % (model.is_cond, model.sample_dir, 'samples_%d' % (idx))
+
+    with open(os.path.join(model.sample_dir, 'samples_%d'%(idx)), 'w') as f:
+        np.save(f, samples)
+
+    if model.is_mixture:
+        y_arr = np.ones((model.batch_size,1), dtype=np.int64)
+        if model.is_cond:
+            y_arr *= y
+        y_onehot = np.zeros((model.batch_size, model.y_dim), dtype=np.int64)
+        y_onehot[:,y] = 1
+
+        feed_dict = {}
+        if model.is_mixture:
+            z_modes = model.modes
+            if z_modes.shape[0] < model.batch_size:
+                z_modes = np.vstack((z_modes, np.zeros((model.batch_size-z_modes.shape[0], model.z_dim))))
+            feed_dict[model.z] = z_modes
+        else:
+            feed_dict[model.labels] = y_onehot
+
+        mode_samples = model.sess.run([model.Gs[0]], feed_dict=feed_dict)[0]
+        mode_samples = np.hstack((y_arr, mode_samples))[:model.modes.shape[0]]
+
+        #modes = model.modes.reshape((-1,2))
+        with open(os.path.join(model.sample_dir, 'modes_%d'%(idx)), 'w') as f:
+            np.save(f, mode_samples)
+        with open(os.path.join(model.sample_dir, 'variances_%d'%(idx)), 'w') as f:
+            np.save(f, model.variances)
+        with open(os.path.join(model.sample_dir, 'responsibilities_%d'%(idx)), 'w') as f:
+            np.save(f, model.responsibilities)
+
+def _get_sample_zs(model):
+    assert model.sample_size > model.batch_size
+    assert model.sample_size % model.batch_size == 0
+    batch_size = model.batch_size // len(model.devices)
+
+    steps = model.sample_size // batch_size
+    assert steps > 0
+
+    sample_zs = []
+    for i in xrange(steps):
+        cur_zs = model.sess.run(model.zses[0])
+        assert all(z.shape[0] == batch_size for z in cur_zs)
+        sample_zs.append(cur_zs)
+    sample_zs = [np.concatenate([batch[i] for batch in sample_zs], axis=0) \
+                 for i in xrange(len(sample_zs[0]))]
+    assert all(sample_z.shape[0] == model.sample_size for sample_z in sample_zs)
+    return sample_zs
+# sample_zs = [(sample_size, z_dim), ...]
+
+def _save_samples(model, sample_zs, idx):
+    samples = []
+    batch_size = model.batch_size // len(model.devices)
+
+    # generator hard codes the batch size
+    for i in xrange(model.sample_size // batch_size):
+        feed_dict = {}
+
+        for z, zv in zip(model.zses[0], sample_zs):
+            if zv.ndim == 2:
+                feed_dict[z] = zv[i*batch_size:(i+1)*batch_size, :]
+            elif zv.ndim == 4:
+                feed_dict[z] = zv[i*batch_size:(i+1)*batch_size, :, :, :]
+            else:
+                assert False
+
+        if model.is_mixture:
+            feed_dict[model.modes_ph] = model.modes
+        cur_samples, = model.sess.run( [model.Gs[0]], feed_dict=feed_dict)
+        samples.append(cur_samples)
+
+    samples = np.concatenate(samples, axis=0)
+    assert samples.shape[0] == model.sample_size
+    save_images(samples, [8, 8], model.sample_dir + '/train_%s.png' % (idx))
+
+    print  "Save Samples (cond=%s) at %s/%s" % (model.is_cond, model.sample_dir, 'train_%s' % (idx))
+
+    if model.is_mixture:
+        modes = model.modes.reshape([-1]+model.image_shape)
+        with open(os.path.join(model.sample_dir, 'modes_%d'%(idx)), 'w') as f:
+            np.save(f, modes)
+
+def get_batch_feed_dict(model, all_images, all_labels):
+    batch_indices = np.random.choice(len(all_labels), size=model.batch_size)
+    batch_images = all_images[batch_indices].astype(np.float32)
+    batch_labels = all_labels[batch_indices].astype(np.int32)
+    return {model.images:batch_images, model.sparse_labels:batch_labels}
