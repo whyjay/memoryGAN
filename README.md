@@ -23,7 +23,7 @@ This repository includes codes for training and testing MemoryGAN with Fashion-M
 Install python packages
 
 ```
-for req in $(cat requirements.txt); do pip install $req; done
+pip install -r requirements.txt
 
 ```
 
